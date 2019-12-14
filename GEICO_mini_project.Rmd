@@ -1,0 +1,457 @@
+---
+title: "GEICO mini-project"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = TRUE)
+```
+
+```{r load-packages}
+library(data.table)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(corrplot)
+library(glmnet)
+library(randomForest)
+library(sampling)
+library(xgboost)
+library(AUC)
+library(ROCR)
+library(PRROC)
+library(caret)
+library(Matrix)
+```
+
+### Helper functions
+```{r helper-functions}
+AddTheme <- function(p, xLab='', yLab='', title=''){
+  p <- p + ggplot2::theme_bw() +
+    ggplot2::labs(x = xLab, y = yLab) +
+    ggplot2::ggtitle(title) +
+    ggplot2::theme(axis.text=element_text(size=8, face="bold"),
+                   axis.title=element_text(size=8, face="bold"),
+                   legend.text=element_text(size=7),
+                   legend.title=element_text(size=7),
+                   title=element_text(size=10, face="bold")) 
+}
+
+MakeHistPlot <- function(DT, xVar, groupVar=NULL, bins=30, position="identity",  xLab='', title='', ...){
+  p <- ggplot2::ggplot(DT, mapping = aes_string(x=xVar, fill=groupVar, color=groupVar), ...) + 
+    ggplot2::geom_histogram(bins=bins, position=position, alpha=.3)
+  p <- AddTheme(p, xLab=xLab, title=title)
+  return(p)
+}
+
+MakeMetricBarplot <- function(DT, xVar, groupVar=NULL, stat='count', xLab='', yLab='', title='', verticalXtickLab=FALSE, ...){
+  if(verticalXtickLab){
+    angle <- 90
+    vjust <- 0.5
+  }else{
+    angle <- 0
+    vjust <- 0
+  }
+  p <- ggplot2::ggplot(DT, aes_string(x=xVar, fill=groupVar)) +
+    ggplot2::geom_bar(stat=stat, ...)
+  p <- AddTheme(p, xLab, yLab, title)
+  return(p)
+}
+
+# plot ranked (exponentiated) coefficent estimates and CIs
+MakeConfIntPlot <- function(DT, xPt, xLower, xUpper, yVar, groupVar=NULL, xLab='', title='', ...){
+  p <- ggplot2::ggplot(data = DT, aes_string(x=xPt, y=yVar, color=groupVar)) +
+    ggplot2::geom_point(...) +
+    ggplot2::geom_errorbarh(aes_string(xmax = xUpper, xmin = xLower, height = .1))
+  p <- AddTheme(p, xLab=xLab, title=title)
+  return(p)
+}
+
+findBestCutoff <- function(probPreds, actualLabel, thresholds=seq(0,1,by=0.01), plot=FALSE){
+  f1scores <- rep(0,length(thresholds))
+  for(i in 1:length(thresholds)){
+    TP = sum((probPreds>thresholds[i]) & (actualLabel==1))
+    FP = sum((probPreds>thresholds[i]) & (actualLabel==0))
+    FN = sum((probPreds<=thresholds[i]) & (actualLabel==1))
+    precision = TP/(TP+FP)
+    recall = TP/(TP+FN)
+    f1scores[i] <- 2/(1/precision+1/recall)
+  }
+  if(plot){
+    plot(thresholds,f1scores,type='b',lwd=2,col="blue",ylab="F1 score",cex.lab=1.2)
+    optimalThreshold <- thresholds[which.max(f1.cv)]
+    abline(v=optimalThreshold,lwd=2,lty="dotted",col="red")
+  }
+  return(optimalThreshold)
+}
+
+perfMetricSummary <- function(predProbs, cutoff, actualLabel){
+  predLabel <- predProbs > cutoff
+  
+  TP = sum(predLabel & (actualLabel==1))
+  FP = sum(predLabel & (actualLabel==0))
+  FN = sum(!predLabel & (actualLabel==1))
+  TN = sum(!predLabel & (actualLabel==0))
+  errorRate = (FP+FN)/length(predLabel)
+  precision = TP/(TP+FP)
+  recall = TP/(TP+FN)
+  sensitivity = recall
+  specificity = TN/(TN+FP)
+  f1 = 2/(1/precision+1/recall)
+  
+  return(list(error_rate=errorRate, precision=precision, recall=recall, specificity=specificity, f1=f1))
+}
+```
+### Data Sanity Check
+```{r data-sanity-check}
+folderPath <- '/Users/xliu/Documents/Other/Geico'
+DT <- data.table::fread(file.path(folderPath, 'DS_MiniProject_ANON.csv'))
+
+# Convert data types
+DT[, `:=`(DATE_FOR = as.Date(DATE_FOR, format='%m/%d/%Y')
+          , Call_Flag = as.factor(Call_Flag))]
+catVars <- c("RTD_ST_CD", "CustomerSegment", "MART_STATUS", "GENDER", "RECENT_PAYMENT"
+            , "NOT_DI_3M", "NOT_DI_6M", "EVENT1_30_FLAG", "POLICYPURCHASECHANNEL")
+numVars <- c("Tenure", "Age", sapply(1:5, function(x){sprintf("CHANNEL%d_6M", x)}, USE.NAMES = FALSE)
+            , sapply(1:5, function(x){sprintf("CHANNEL%d_3M", x)}, USE.NAMES = FALSE), "METHOD1_6M", "METHOD1_3M"
+            , "PAYMENTS_6M", "PAYMENTS_3M", "EVENT2_90_SUM", "LOGINS")
+targetVar <- "Call_Flag"
+
+DT[, (catVars) := lapply(.SD, as.factor), .SDcols = catVars]
+
+# Drop EVENT1_30_FLAG since all its values=0
+DT[, EVENT1_30_FLAG:=NULL]
+catVars <- catVars[catVars!='EVENT1_30_FLAG']
+# Drop DATE_FOR assuming examples are time-independent
+DT[, DATE_FOR:=NULL]
+
+# Check the number of unique values for some categorical fields 
+DT[, lapply(.SD, function(x){length(unique(x))})
+   , .SDcols = c("RTD_ST_CD"
+                 ,"CustomerSegment"
+                 ,"MART_STATUS")]
+
+# Balanced classes?
+DT[, .N, by = Call_Flag]
+DT[, sum(Call_Flag==1)/sum(Call_Flag==0)]
+```
+### Impute Missing Values
+```{r missing-values}
+# Any missing Values?
+DT[!complete.cases(DT), .N]
+
+# Columns that have missing values
+naCols <- grep('(CHANNEL[1-5]|PAYMENTS|METHOD1)_6M$',names(DT), value=TRUE)
+naCols <- c(naCols, 'RECENT_PAYMENT')
+completeCols <- setdiff(names(DT), naCols)
+
+summary(DT[!complete.cases(DT), completeCols, with=FALSE])
+
+# It is likely that it is NOT missing at random. Impute NAs by 0s
+DT[is.na(DT)] <- 0
+```
+
+### Univariate Analysis
+Distributions of numerical variables
+```{r numerical-variables, fig.width=10, fig.height=12}
+plotList <- list()
+for(variable in numVars){
+  p <- MakeHistPlot(DT[, c(variable, targetVar), with=FALSE]
+                     , xVar = variable
+                     , groupVar = targetVar
+                     , bins = 50
+                     , xLab = ''
+                     , title = variable)
+  plotList <- c(plotList, list(p))
+}
+
+grid.arrange(grobs=plotList, ncol=3, nrow=6)
+```
+Distributions of categorical variables
+```{r categorical-variables, fig.width=10, fig.height=8}
+plotList <- list()
+for(variable in catVars){
+  p <- MakeMetricBarplot(DT[, c(variable, targetVar), with=FALSE]
+                     , xVar = variable
+                     , groupVar = targetVar
+                     , xLab = ''
+                     , yLab = 'Count'
+                     , title = variable
+                     , verticalXtickLab = TRUE)
+  plotList <- c(plotList, list(p))
+}
+grid.arrange(grobs=plotList, ncol=3, nrow=3)
+```
+
+### Correlation of Numerical Input Variables
+```{r correlation, fig.width=8, fig.height=6.5}
+# Spearman correlation
+corrMat <- cor(subset(DT, select = numVars), method='spearman')
+corrplot::corrplot(corrMat, method = "circle", tl.col="black", tl.srt=45, tl.cex = 0.7)
+```
+
+### Training, Validation, and Test Set Partition
+```{r train-test-split}
+set.seed(1234) # set random number generator seed for reproduciblity
+kfolds <- 5
+DT[, Call_Flag := ifelse(Call_Flag==1, 1, 0)]
+trainInd <- createDataPartition(DT$Call_Flag, p = .7, list = FALSE) # stratified sampling with a 70-30 split
+trainDT <- DT[trainInd,]
+testDT <- DT[-trainInd,] # hold-out test set
+cvSplits <- createFolds(as.factor(trainDT$Call_Flag), k=kfolds)
+```
+
+### Logistic Regression with L1 Regularization
+Tune $\lambda$ using cross-validation
+```{r logistic-regression-cv}
+# imbalanced data
+classRatio <- sum(trainDT$Call_Flag==1)/sum(trainDT$Call_Flag==0)
+weights <- trainDT$Call_Flag
+weights[weights==0] <- classRatio
+
+# # full model
+# model.logitFull <- glm(Call_Flag ~ ., data=trainDT, family = binomial(link = "logit"), weights = weights)
+# summary(model.logitFull)
+
+# Lasso
+X.train <- model.matrix(~.-1, subset(trainDT, select = -Call_Flag)) # expanding factors to a set of dummy variables 
+y.train <- as.factor(trainDT$Call_Flag)
+
+model.logitL1 <- glmnet(X.train, y.train, alpha=1, family="binomial", weights = weights, nlambda = 10)
+# plot(model.logitL1, xvar = "lambda", label = TRUE)
+
+model.logitL1CV <- cv.glmnet(X.train, y.train, alpha=1, family="binomial", weights = weights)
+plot(model.logitL1CV)
+
+model.logitL1 <- glmnet(X.train, y.train, alpha=1, lambda=model.logitL1CV$lambda.1se, family="binomial", weights = weights) 
+# print(model.logitL1$beta)
+```
+Fit the reduced model according to the $\lambda$ selected
+```{r reduced-logit-model}
+# reduced model
+fmla <- as.formula('Call_Flag ~ RTD_ST_CD + CustomerSegment + Tenure + Age + 
+                            CHANNEL2_6M + CHANNEL4_6M + CHANNEL5_6M + RECENT_PAYMENT + CHANNEL1_3M +
+                            CHANNEL4_3M + PAYMENTS_3M + NOT_DI_3M  + LOGINS +
+                            POLICYPURCHASECHANNEL')
+model.logitReduced <- glm(fmla, data=trainDT, family = binomial(link = "logit"), weights = weights)
+summary(model.logitReduced)
+```
+Estimate generalization performance
+```{r logit-generalization-cv}
+# cross validation estimate on generalization performance
+cvFit.logit <- rep(0, nrow(trainDT))
+for (j in 1:kfolds){
+  testIdx <- cvSplits[[j]]
+  ratio <- sum(trainDT[-testIdx,Call_Flag]==1)/sum(trainDT[-testIdx,Call_Flag]==0)
+  wgts <- trainDT$Call_Flag[-testIdx]
+  wgts[wgts==0] <- ratio
+  model.logitCV <- glm(fmla, data=trainDT[-testIdx,], family = binomial(link = "logit"), weights = wgts)
+  cvFit.logit[testIdx] <- predict(model.logitCV, trainDT[testIdx,], type="response")
+}
+```
+
+### Gradient Boosting Trees
+Tune model hyperparameters using cross validation
+```{r xgboost-cv}
+# Prepare data for xgboost
+trainSpMat <- sparse.model.matrix(Call_Flag~-1+., data=trainDT, row.names=FALSE)
+testSpMat <- sparse.model.matrix(Call_Flag~-1+., data=testDT, row.names=FALSE)
+
+# parameter list:
+# eta: learning rate
+# min_child_weight: minimum number of instances needed for a leaf node
+# max_depth: maximum depth of a tree
+# subsample: subset ratio of the training instance
+# eval_metric: evaluation metrics for validation dat
+# scale_pos_weight: control the balance of positive and negative weights
+
+# Use empirical parameter values for eta, min_child_weight,subsample
+paramList <- list(booster="gbtree"
+                  , eta=0.2
+                  , min_child_weight=10
+                  , subsample=0.8
+                  , objective="binary:logistic"
+                  , eval_metric="aucpr"
+                  , scale_pos_weight=1/classRatio)
+
+# Tune nrounds and max_depth
+searchGrid <- expand.grid(nrounds = c(20,50,100), 
+                          max_depth = c(3, 4, 5))
+
+evalList <- list(nrounds=rep(0,nrow(searchGrid)), auc=rep(0,nrow(searchGrid)))
+cvFit.xgb <- matrix(0, nrow=nrow(trainDT), ncol=nrow(searchGrid)) # store cross-validated prediction values
+
+for (t in seq_along(1:nrow(searchGrid))){
+  paramList$max_depth <- searchGrid$max_depth[t]
+  
+  model.xgbCV <- xgb.cv(params=paramList
+                        , data=trainSpMat
+                        , nrounds=searchGrid$nrounds[t]
+                        , nfold=kfolds
+                        , label=trainDT$Call_Flag
+                        , prediction=TRUE
+                        , metrics=list("aucpr")
+                        , stratified=TRUE
+                        , verbose=FALSE
+                        , early_stopping_rounds = TRUE) # stratified sampling and using PR-AUC as the metric to tune parameters
+  
+  evalList$nrounds[t] <- model.xgbCV$best_iteration
+  evalList$auc[t] <- max(model.xgbCV$evaluation_log$test_auc_mean)
+  cvFit.xgb[,t] <- model.xgbCV$pred
+}
+
+optimalIdx <- which.max(evalList$auc)
+cvFit.xgb <- cvFit.xgb[, optimalIdx]
+```
+Fit the model using the entire training set and the optimal parameters
+```{r xgboost-training}
+paramList$max_depth <- evalList$max_depth[optimalIdx]
+model.xgb <- xgboost(data=trainSpMat
+                     , label=trainDT$Call_Flag
+                     , params=paramList
+                     , nrounds=evalList$nrounds[optimalIdx]
+                     , verbose=FALSE)
+```
+
+### Random Forest
+Tune model hyperparameters using cross validation
+```{r random-forest-cv}
+numTrees <- 500
+minLeafNodes <- 20
+p <- ncol(trainDT)-1
+numVars <- round(c(0.1,0.2,0.3,0.5)*p)  # Select the optimal size of variable subset for each tree-growing
+
+cvAUC.rf <- matrix(0,nrow=length(numVars),ncol=kfolds)
+cvFit.rf <- matrix(0, nrow=nrow(trainDT), ncol=length(numVars))
+
+for (i in 1:length(numVars)){
+  for (j in 1:kfolds){
+    testIdx <- cvSplits[[j]]
+    n_minor.train <- sum(trainDT$Call_Flag[-testIdx]==1)
+    model.rfCV <- randomForest(as.factor(Call_Flag) ~ .
+                               , data=trainDT[-testIdx,]
+                               , mtry=numVars[i]
+                               , ntree=numTrees
+                               , nodesize=minLeafNodes
+                               , strata=as.factor(trainDT$Call_Flag[-testIdx])
+                               , sampsize=c(2*n_minor.train,n_minor.train))  # stratified subsampling
+    cvFit.rf[testIdx,i] <- unname(predict(model.rfCV, trainDT[testIdx,], type="prob")[,2])
+    cvAUC.rf[i,j] <- pr.curve(cvFit.rf[testIdx, i], weights.class0=trainDT$Call_Flag[testIdx])$auc.integral
+  }
+}
+optimalIdx <- which.max(rowMeans(cvAUC.rf))
+optimalNumVar <- numVars[optimalIdx]
+cvFit.rf <- cvFit.rf[, optimalIdx]
+```
+Fit the model using the entire training data and the optimal parameters
+```{r random-forest-training}
+n_minor <- sum(trainDT$Call_Flag==1)
+model.rf <- randomForest(as.factor(Call_Flag) ~ .
+                         , data=trainDT,strata=as.factor(trainDT$Call_Flag)
+                         , sampsize=c(2*n_minor,n_minor)
+                         , ntree=numTrees
+                         , nodesize=minLeafNodes
+                         , mtry=optimalNumVar
+                         , importance=F)
+```
+
+### Variable Importance
+```{r variable-importance}
+topN <- 30
+# logistic regression (L1-regularized)
+# Effect size
+expCoefs <- exp(coefficients(model.logitReduced))
+# Exponentiate Wald confidence intervals to get on the odds-scale
+expCoefCIs <- exp(confint.default(model.logitReduced , level=0.95))
+expCoefsDT <- data.table(data.frame(cbind(expCoefs,expCoefCIs)), keep.rownames=TRUE)
+colnames(expCoefsDT) <- c("variable", "exp_coef", "CI_lower", "CI_upper")
+expCoefsDT <- expCoefsDT[variable!='(Intercept)'][order(-exp_coef)]
+expCoefsDT[, variable := factor(variable, levels=expCoefsDT[order(exp_coef),variable])]
+
+p <- MakeConfIntPlot(expCoefsDT[1:topN,]
+                     , xPt = 'exp_coef'
+                     , xLower = 'CI_lower'
+                     , xUpper = 'CI_upper'
+                     , yVar = 'variable'
+                     , xLab = 'Coefficient Estimates (exp)'
+                     , title = 'Effect size')
+print(p)
+
+# xgboost
+xgbVarImp <- xgb.importance(feature_names = trainSpMat@Dimnames[[2]], model = model.xgb)
+xgb.plot.importance(importance_matrix = xgbVarImp, top_n=topN, measure='Gain', cex=0.8)
+
+# random forest
+varImpPlot(model.rf, sort=TRUE, cex=0.8, n.var=topN, color="black", main="Variable Importance")
+```
+
+### Model Evaluation
+Apply trained models on the holdout test data
+```{r model-pred}
+pred.logit <- predict(model.logitReduced, testDT, type = 'response')
+pred.xgb <- predict(model.xgb, testSpMat)
+pred.rf <- unname(predict(model.rf,testDT,type="prob")[,2])
+```
+Precision-recall curves
+```{r PR-curves, fig.width=8, fig.height=6.5}
+# PR curves
+perf.logit <- performance(prediction(pred.logit, as.factor(testDT$Call_Flag)),"prec","rec")
+perf.xgb <- performance(prediction(pred.xgb, as.factor(testDT$Call_Flag)),"prec","rec")
+perf.rf <- performance(prediction(pred.rf, as.factor(testDT$Call_Flag)),"prec","rec")
+
+auc.logit <- pr.curve(pred.logit, weights.class0=testDT$Call_Flag)$auc.integral
+auc.xgb <- pr.curve(pred.xgb, weights.class0=testDT$Call_Flag)$auc.integral
+auc.rf <- pr.curve(pred.rf, weights.class0=testDT$Call_Flag)$auc.integral
+
+# plot PR curves
+par(pty="s")
+plot(perf.logit,lwd=3,col="red",cex.lab=1.2)
+plot(perf.xgb,lwd=3,col="green",add=TRUE)
+plot(perf.rf,lwd=3,col="blue",add=TRUE)
+legend("topright", legend=c(paste0("Logistic Regression (AUC=",round(auc.logit,3),")"),
+                               paste0("XGboost (AUC=",round(auc.xgb,3),")"),
+                               paste0("Random Forest (AUC=",round(auc.rf,3),")")),
+       col=c("red","green","blue"), lwd=3, cex=0.9)
+grid(nx=NULL,ny=NULL, col="lightgray", lty="dotted")
+```
+
+Select the best cutoff values based on the generaliztion performance estimation during the training stage 
+```{r cutoff-selection}
+f1.logit <- performance(prediction(cvFit.logit, as.factor(trainDT$Call_Flag)),"f")
+f1.xgb <- performance(prediction(cvFit.xgb, as.factor(trainDT$Call_Flag)),"f")
+f1.rf <- performance(prediction(cvFit.rf, as.factor(trainDT$Call_Flag)),"f")
+
+optimalCutoff.logit <- f1.logit@x.values[[1]][which.max(f1.logit@y.values[[1]])]
+optimalCutoff.xgb <- f1.xgb@x.values[[1]][which.max(f1.xgb@y.values[[1]])]
+optimalCutoff.rf <- f1.rf@x.values[[1]][which.max(f1.rf@y.values[[1]])]
+
+plot(f1.logit, lwd=3, col="red", cex.lab=1.2, ylim=c(0,0.4))
+plot(f1.xgb, lwd=3, col="green", add=TRUE)
+plot(f1.rf, lwd=3, col="blue", add=TRUE)
+
+abline(v=optimalCutoff.logit,lwd=2,lty="dotted",col="red")
+abline(v=optimalCutoff.xgb,lwd=2,lty="dotted",col="green")
+abline(v=optimalCutoff.rf,lwd=2,lty="dotted",col="blue")
+legend("topleft", legend=c("Logistic Regression",
+                            "XGboost",
+                            "Random Forest"),
+       col=c("red","green","blue"), lwd=2.5, cex=0.8)
+grid(nx=NULL,ny=NULL, col="lightgray", lty="dotted")
+```
+
+Apply cutoffs to generate binary outputs and the corresponding performance summary 
+```{r summary}
+summary.logit <- perfMetricSummary(pred.logit, optimalCutoff.logit, testDT$Call_Flag)
+summary.xgb <- perfMetricSummary(pred.xgb, optimalCutoff.xgb, testDT$Call_Flag)
+summary.rf <- perfMetricSummary(pred.rf, optimalCutoff.rf, testDT$Call_Flag)
+
+summaryTable <- rbindlist(list(summary.logit, summary.xgb, summary.rf))
+summaryTable[, model:=c('logistic regression', "xgboost", "random forest")]
+setcolorder(summaryTable, c('model', 'error_rate', 'precision', 'recall', 'specificity', 'f1'))
+knitr::kable(summaryTable)
+```
+
+
+

@@ -1,0 +1,357 @@
+---
+title: "DoorDash Analytics Sample Data Exercise"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = TRUE, echo = FALSE, warning = FALSE, message = FALSE, cache = TRUE)
+```
+
+```{r load-data}
+rm(list=ls())
+library(data.table)
+library(ggplot2)
+
+folder <- '/home/xliu/Other/DoorDash'
+DT <- data.table::fread(file.path(folder, 'Analytics_Sample_Data.csv'))
+```
+
+```{r helper-functions}
+# A hacky way of converting timestamps: since the year and month are unknown and are not of interest for the study,
+# dates are assumed to be 05/31/2018-06/30/2018 for easy timezone conversion
+ConvertDateTime <- function(datetime){
+  ts <- .POSIXct(character(length(datetime)))
+  ind_31 <- grepl('^31 *', datetime)
+  ts[ind_31] <- as.POSIXct(gsub('([0-9]{2}) (*)', '2018-05-\\1 \\2', datetime[ind_31]), format="%Y-%m-%d %H:%M:%S", tz='UTC')
+  ts[!ind_31] <- as.POSIXct(gsub('([0-9]{2}) (*)', '2018-06-\\1 \\2', datetime[!ind_31]), format="%Y-%m-%d %H:%M:%S", tz='UTC')
+  ts <- as.POSIXct(format(ts, tz="America/Los_Angeles", usetz=TRUE), format='%Y-%m-%d %H:%M:%S', tz="America/Los_Angeles")
+  return(ts)
+}
+
+# bucket time in 3 groups (lunch, dinner, and other)
+GroupTime <- function(datetime){
+  if(is.na(datetime)){
+    return("Other")
+  }else if(hour(datetime) >= 11 & hour(datetime) <= 14){
+    return("Lunch")
+  }else if(hour(datetime) >= 17 & hour(datetime) <= 20){
+    return("Dinner")
+  }else{
+    return("Other")
+  }
+}
+
+MakeHistDenPlot <- function(DT, xVar, groupVar=NULL, bins=30, position="identity",  xLab='', title='', ...){
+  p <- ggplot2::ggplot(DT, mapping = aes_string(x=xVar, fill=groupVar, color=groupVar), ...) + 
+    ggplot2::geom_histogram(mapping = aes(y=..density..),    
+                            bins=bins, position=position, alpha=.3) +
+    ggplot2::geom_density(mapping = aes_string(color=groupVar), alpha=0, size=1.5) +
+    ggplot2::theme_bw() +
+    ggplot2::xlab(xLab) +
+    ggplot2::ggtitle(title) +
+    ggplot2::theme(axis.text=element_text(size=14, face="bold"),
+                   axis.title=element_text(size=16, face="bold"),
+                   legend.text=element_text(size=14),
+                   legend.title=element_text(size=14),
+                   title=element_text(size=18, face="bold"))
+  return(p)
+}
+
+MakeMetricBoxplot <- function(DT, xVar, yVar, groupVar=NULL, xLab='', yLab='', title='', verticalXtickLab=FALSE, ...){
+  if(verticalXtickLab){
+    angle <- 90
+    vjust <- 0.5
+  }else{
+    angle <- 0
+    vjust <- 0
+  }
+  p <- ggplot2::ggplot(DT, aes_string(x = xVar, y = yVar, fill = groupVar)) +
+    ggplot2::geom_boxplot(...) +
+    gguptake::theme_uptake() +
+    ggplot2::xlab(xLab) +
+    ggplot2::ylab(yLab) +
+    ggplot2::ggtitle(title) +
+    ggplot2::theme(axis.text=element_text(size=14, face="bold"),
+                   axis.title=element_text(size=16, face="bold"),
+                   legend.text=element_text(size=14),
+                   legend.title=element_text(size=14),
+                   title=element_text(size=18, face="bold"),
+                   axis.text.x = element_text(angle = angle, vjust = vjust))
+  return(p)
+}
+
+MakeConfIntPlot <- function(DT, xPt, xLower, xUpper, yVar, groupVar=NULL, xLab='', title='', ...){
+  p <- ggplot2::ggplot(data = DT, aes_string(x=xPt, y=yVar, color=groupVar)) +
+    ggplot2::geom_point() +
+    ggplot2::geom_errorbarh(aes_string(xmax = xUpper, xmin = xLower, height = .1)) +
+    ggplot2::theme_bw() +
+    ggplot2::labs(x = xLab, y = NULL) +
+    ggplot2::ggtitle(title) +
+    ggplot2::theme(axis.text=element_text(size=12, face="bold"),
+                   axis.title=element_text(size=14, face="bold"),
+                   legend.text=element_text(size=12),
+                   legend.title=element_text(size=12),
+                   title=element_text(size=16, face="bold"))
+  return(p)
+}
+```
+
+## Data Cleaning and Pre-processing
+1. Converted time-related columns to workable timestamps and changed the timezone
+
+2. Defined a set of duration fields as follows:
+
+    **Total_delivery_duration** = Delivered_to_consumer_datetime -  Customer_placed_order_datetime
+
+    **Order_processing_time** = Placed_order_with_restaurant_datetime - Customer_placed_order_datetime
+
+    **Driver_pickup_duration** = Driver_at_restaurant_datetime - Customer_placed_order_datetime
+
+    **Driver_delivery_duration** = Delivered_to_consumer_datetime - Driver_at_restaurant_datetime
+
+    **Total_driver_involved_time** = Delivered_to_consumer_datetime - Placed_order_with_restaurant_datetime
+
+3. Bucket *Placed_order_with_restaurant_datetime* by the following rules:
+
+    11am-2pm: **Lunch**
+
+    5pm-8pm: **Dinner**
+
+    Else: **Other**
+
+```{r clean-and-preprocess-data}
+names(DT) <- sapply(names(DT), function(x){gsub(' ', '_', x)}, USE.NAMES=FALSE)
+# Convert variable data types
+dateTimeCols <- grep('*_datetime$', names(DT), value=TRUE)
+
+DT[, (dateTimeCols) := lapply(.SD, ConvertDateTime), .SDcols = dateTimeCols] 
+DT[Driver_ID==426 & Consumer_ID==59745, Placed_order_with_restaurant_datetime:=Placed_order_with_restaurant_datetime+60*60*24*30]
+DT[Driver_ID==216 & Consumer_ID==85535, Is_ASAP := FALSE]
+
+DT[, `:=`(Total_delivery_duration = as.integer(difftime(Delivered_to_consumer_datetime, Customer_placed_order_datetime, units = "mins"))
+          , Order_processing_time = as.integer(difftime(Placed_order_with_restaurant_datetime, Customer_placed_order_datetime, units = "mins"))
+          , Driver_pickup_duration = as.integer(difftime(Driver_at_restaurant_datetime, Customer_placed_order_datetime, units = "mins"))
+          , Driver_delivery_duration = as.integer(difftime(Delivered_to_consumer_datetime, Driver_at_restaurant_datetime, units = "mins"))
+          , Total_driver_involved_time = as.integer(difftime(Delivered_to_consumer_datetime, Placed_order_with_restaurant_datetime, units = "mins"))
+          , Delivery_Region = as.factor(Delivery_Region))]
+
+# Bucket time
+DT[, Delivery_Time := as.factor(sapply(Placed_order_with_restaurant_datetime, GroupTime))]
+
+# summary(DT)
+# DT[, lapply(.SD, function(x){length(unique(x))}), .SDcols = c("Driver_ID", "Restaurant_ID", "Consumer_ID")]
+```
+
+## Insights 
+### Overview
+Since DoorDash acts as an integrator between restaurants, drivers and users, the data are analyzed for those three segments involved with DoorDash business model.
+
+### Restaurants
+The restaurant engagement affects the user choices which indirectly incluence the amount of orders from which DoorDash charges commissions. Also, DoorDash charges restaurants for advertising on the platform. Thus increasing the restaurant involvement will benifit revenue generation.
+
+When looking at distribution of the number of orders each restaurant was associated with during the study period, given the fact that the three regions (ignoring 'None') have comparable size we found that the restaurants in Palo Alto intend to have more orders per restaurants. And the ANOVA test shows that there exists differences in the mean order count for the three regions. However, given the target variable is a count value and the empirical distributions are skewed, the assumptions of ANOVA may not be valid here. We can further conduct some nonparamatric tests. If the differences do exist, a recommendation would be: **improve product features to increase the average order count per restaurant in San Jose and Mountain View.**
+```{r distribution-order-region, fig.width=8, fig.height=5}
+DT[, .(Number_of_restaurants = length(unique(Restaurant_ID))), by=Delivery_Region]
+p <- MakeHistDenPlot(DT[Delivery_Region != "None", .(Order_count = .N), by = .(Restaurant_ID, Delivery_Region)]
+                     , xVar = 'Order_count'
+                     , groupVar = 'Delivery_Region'
+                     , bins = 100
+                     , xLab = 'Order_count')
+print(p)
+
+p <- MakeMetricBoxplot(DT[Delivery_Region != "None", .(Order_count = .N), by = .(Restaurant_ID, Is_New, Delivery_Region)]
+                       , xVar = 'Delivery_Region'
+                       , yVar = 'Order_count'
+                       , groupVar = 'Is_New'
+                       , yLab = 'Order count')
+print(p)
+
+deliveryRegionANOVA <- aov(Order_count ~ Delivery_Region, data = DT[Delivery_Region != "None", .(Order_count = .N), by = .(Restaurant_ID, Delivery_Region)])
+summary(deliveryRegionANOVA)
+```
+
+Likewise, we can investigate the interaction between consumers and restaurants by region. A similar conclusion is drawn: Palo Alto tends to have more customers per restaurant on average (To be more precisely, we should normalize by the population of each region here but we don't have the information therefore we assume they are equal-sized).
+
+```{r distribution-customer-region, fig.width=8, fig.height=5}
+# number of unique consumers (should be normalized by population) 
+p <- MakeMetricBoxplot(DT[Delivery_Region != "None", .(Number_of_customers = length(unique(Consumer_ID))), by = .(Restaurant_ID, Delivery_Region)]
+                       , xVar = 'Delivery_Region'
+                       , yVar = 'Number_of_customers'
+                       , yLab = 'Number of unique customers')
+print(p)
+
+consumerRegionANOVA <- aov(Number_of_customers ~ Delivery_Region, data = DT[Delivery_Region != 'None', .(Number_of_customers = length(unique(Consumer_ID))), by = .(Restaurant_ID, Delivery_Region)])
+summary(consumerRegionANOVA)
+```
+
+Another perspective is to look at the proportion of unsuccessful orders. Here we treated any orders with refunded amount = 0 as unfulfilled. We conducted the proportion tests for region and time seperately. Despite the 95% confidence interval estimation and two-sided two-proportion hypothesis tests have slightly different conclusions due to the pooled proportion estimates, we can still see the evident differences between on-demand orders and scheduled deliveries for Palo Alto and for the time that is neither lunch nor dinner. A recommendation would be: **decrease the unfulfilled order rates for Palo Alto and Mountain View as well as non-lunch time**
+```{r prop-unsuccess-region, fig.width=10, fig.height=7}
+# proportion of unsuccessful orders by region
+# DT[, .(Percent_of_unsuccessful = round(100*sum(Refunded_amount!=0)/.N,2)), by = .(Is_ASAP, Delivery_Region)]
+
+propEstDT.region <- DT[, .(p = sum(Refunded_amount!=0)/.N
+                    , N = .N), by = .(Is_ASAP, Delivery_Region)]
+propEstDT.region[, `:=`(CI_lower = p - 1.96*sqrt(p*(1-p)/N),
+                 CI_upper = p + 1.96*sqrt(p*(1-p)/N))]
+propEstDT.region[, (c("p","CI_lower", "CI_upper")) := lapply(.SD, function(x){round(100*x,2)}), .SDcols = c("p","CI_lower", "CI_upper")]
+
+p <- MakeConfIntPlot(propEstDT.region, xPt = 'p', xLower = 'CI_lower', xUpper = 'CI_upper'
+                     , yVar = 'Delivery_Region', groupVar = 'Is_ASAP', xLab='Proportion Estimate (%)'
+                     , title = 'Percentage of unsuccessful orders and 95% confidence intervals')
+print(p)
+
+propTestDT.region <- DT[Delivery_Region!='None', .(success = Refunded_amount==0, Is_ASAP, Delivery_Region)]
+
+for(region in unique(propTestDT.region$Delivery_Region)){
+  print(region)
+  print(prop.test(table(propTestDT.region[Delivery_Region==region, Is_ASAP], propTestDT.region[Delivery_Region==region, success])
+            , alternative='two.sided', correct=FALSE)
+  )
+}
+```
+
+
+```{r prop-unsuccess-time, fig.width=10, fig.height=7}
+# DT[, .(Percent_of_unsuccessful = round(100*sum(Refunded_amount!=0)/.N,2)), by = .(Is_ASAP, Delivery_Time)]
+
+propEstDT.time <- DT[, .(p = sum(Refunded_amount!=0)/.N
+                    , N = .N), by = .(Is_ASAP, Delivery_Time)]
+propEstDT.time[, `:=`(CI_lower = p - 1.96*sqrt(p*(1-p)/N),
+                 CI_upper = p + 1.96*sqrt(p*(1-p)/N))]
+propEstDT.time[, (c("p","CI_lower", "CI_upper")) := lapply(.SD, function(x){round(100*x,2)}), .SDcols = c("p","CI_lower", "CI_upper")]
+
+p <- MakeConfIntPlot(propEstDT.time, xPt = 'p', xLower = 'CI_lower', xUpper = 'CI_upper'
+                     , yVar = 'Delivery_Time', groupVar = 'Is_ASAP', xLab='Proportion Estimate (%)'
+                     , title = 'Percentage of unsuccessful orders and 95% confidence intervals')
+print(p)
+
+propTestDT.time <- DT[, .(success = Refunded_amount==0, Is_ASAP, Delivery_Time)]
+
+for(time in unique(propTestDT.time$Delivery_Time)){
+  print(time)
+  print(prop.test(table(propTestDT.time[Delivery_Time==time, Is_ASAP], propTestDT.time[Delivery_Time==time, success])
+                  , alternative='two.sided', correct=FALSE)
+  )
+}
+
+```
+
+### Dashers 
+The engagement of Dashers (drivers) affects the delivery duration which directly influences user experience.
+
+First the number of dashers during the study period shows some differences for the three regions although the numbers should be normalized by population. A recommendation would be: **increase the number of Dashers in Mountain View and San Jose.**
+```{r drivers}
+DT[, .(Number_of_drivers = length(unique(Driver_ID))), by = Delivery_Region]
+```
+
+Increasing the amount of tip will be likely to increase Dasher's involvement.  A linear regssion model shows the expected amount of tip per order is significantly related to *Total_delivery_duration*, *Order_total*, *Is_ASAP*, *Delivery_Region*, *Delivery_Time* (Here we assume these factors are indepedent although in reality they may not be). Therefore **any product feature modifications that change these factors will likely have an impact on the average tip per order.** 
+```{r tip}
+tipLM <- lm(Amount_of_tip ~ Total_delivery_duration + Order_total + Is_ASAP + Delivery_Region + Delivery_Time, data = DT)
+# plot(fitted(tipLM), DT$Amount_of_tip, xlab = 'Fitted', ylab = 'Actual')
+summary(tipLM)
+```
+
+Fro delivery duration, we first regressed *total_driver_involved_time* on *Is_ASAP*, *Delivery_Region*, *Delivery_Time* and noticed these covariates are all siginicantly correlated with delivery duration. Next, we focused on on-demand orders and conduct two-way ANOVA based on *Delivery_Region* and *Delivery_Time*. Again the boxplot and ANOVA tell slightly different stories due to the skewed distributions of delivery time. It was found that: a. Theres exists mean time difference among those spatio-temporal buckets, which suggests the further analysis should be done seperately in space and time; b. The interaction between region and time is not signiciantly.
+
+```{r delivery-duration}
+deliveryLM <- lm(Total_driver_involved_time ~ Is_ASAP + Delivery_Region + Delivery_Time, data = DT)
+summary(deliveryLM)
+
+p <- MakeMetricBoxplot(DT[Is_ASAP==TRUE & Total_driver_involved_time >= 0]
+                       , xVar = 'Delivery_Region'
+                       , yVar = 'Total_driver_involved_time'
+                       , groupVar = 'Delivery_Time'
+                       , yLab = 'Driver Delivery Time (minuties)')
+print(p)
+
+deliveryTimeANOVA <- aov(Total_driver_involved_time ~ Delivery_Region + Delivery_Time + Delivery_Region:Delivery_Time, data = DT[Is_ASAP==TRUE & Total_driver_involved_time >= 0])
+summary(deliveryTimeANOVA)
+```
+
+### Customers
+Lastly, we explored customers' activities. Specifically, we investigated **the effect of discount** and **customer retention**.
+
+For discount, the following regression shows the positive correlation between the total amount an consumer spent on an order and the amount of discount which suggests that **increasing discounts will be likely to increase the average order value which increases the commissions as a result.** 
+```{r order-discount}
+orderAmountLM <- lm(Order_total ~ Amount_of_discount, data = DT)
+summary(orderAmountLM)
+```
+
+For retention, we ran a Poisson regression for the total amount of money each consumer spent. However, we can not draw any conclusions at this moment due to the facts that: 1. Date is missing in the data. So time-dependent information can't be resorted to unveil the sequence of events, e.g. the change of order rate after an unfulfilled order for a consumer; 2. Sometimes the same consumer_ID is tied to mulpitle *Is_New = True* records. It is unclear if it is a data logging issue.
+```{r retention}
+orderCountDT <- DT[, .(total_order_count = .N, unsuccessful_order_count = sum(Refunded_amount!=0), new_order_count = sum(Is_New)
+                       , total_amount_of_discount = sum(Amount_of_discount))
+                   , by = Consumer_ID]
+OrderCountGLM <- glm(total_order_count ~ unsuccessful_order_count + new_order_count + total_amount_of_discount
+                     , data = orderCountDT
+                     , family = poisson(link = "log"))
+summary(OrderCountGLM)
+```
+
+## Summary
+We provide the following recommendations/insights based on the initial analysis of the sample data:
+
+**1. Improve product features to increase the amount of orders as well as the amount of unique customers per restaurant in San Jose and Mountain View.**
+
+**2. Decrease the unfulfilled order rates for Palo Alto and Mountain View as well as for non-lunch time.**
+
+**3. Increase the number of Dashers in Mountain View and San Jose.**
+
+**4. Any product feature modifications that change *Total_delivery_duration*,  *Order_total*, *Is_ASAP*, *Delivery_Region* and *Delivery_Time* will likely have an impact on the average tip per order.**
+
+**5. Analysis of reducing delivery duration should be conducted in different spatio-temporal buckets.**
+
+**6. Increasing discounts will be likely to increase the average order value.**
+
+
+## Experiment Outline
+Since reducing delivery duration can influence the unsuccessful order rates, in the spirit of a top-down process, we aim to study the effect of a product/business change on the delivery duration.
+
+**Hypothesis**: Change product feature X will reduce delivery duration
+
+
+**Metrics**: mean, median, and some other percentiles of delivery durations before and after the change
+
+The rule of thumb of choosing percentile metirces is that select the ones that are sensitive enough to the chnages one cares about in the meantime robust enough to the changes one doesn't care about. For example, 99th percentile may be not robust to the other changes while 10th percentile may be not sensitive enough to the change in our hypothesis.
+
+
+**Experiment Design**:
+
+1. *Determine subject (unit)*: spatio-temporal cell
+
+    - Dasher may not be a good subject in this experiment because the assignment of 'treatment' and 'control' would not be easy to control as the assignment may depend on the dynamic delivery circumstances. As a result, switching groups would occur. Instead, we can set up a grid that partitions space and time. E.g, a spatio-temporal cell could be 2 hours*5 square miles. To alleviate the variances introduced by spatio-temporal differences (e.g., urban-rural, lunch-dinner, ...), we can uniformly select cells that share similar spatio-temperoal characteristics in the randomization process.
+
+
+2. *Run A/A tests*:
+
+    - Evaluate the intrinsic variablity
+    - Check if the outcomes of invariant metrics are similar in treatment and control
+
+3. *Sizing*: 
+
+    - Conduct power analysis (provide significance level (type I error rate), power (1-type II error rate), and minimun difference that one wants to detect to detemine the sample size)
+
+3. *Determine experiment duration*:
+
+    - Examine whether the outcomes have seasonal pattern, weekly pattern (weekend vs. weekday), ... If yes, make sure each segment has its exposure in the experiment.
+
+4. *Randomization*:
+
+    - Randomization is done on the space-time unit level. Each delivery is assigned into to a treatment or control group based on its geographic region and time. To reduce the impact of spatial and/or temporal correlation, the likelihood of selecting adjacent cells should be small (similar to the rationale of block bootstrap).
+
+5. *Statistic Test*:
+
+    - The assumptions of analytic distributions are likely to be violated. As a result, non-parametric tests (e.g. Mann-Whitney Utest) should be applied.
+
+6. *Multiple comparison correction*
+
+
+## Implementing the change on a larger scale
+
+Assuming that the experiment proved the hypothesis was true, it might not be ready to launch the change on a larger scale yet. The reasons are: 
+
+1. The experiments may not reflect/factor in the geographic region difference (e.g. west coast vs. east coast). And further experiments should be carry out.
+2. In the case where the long-term temporal factors could affect (e.g. season factor), the change effect should be monitored over a long period.
+3. The change may lead to some other (negative) changes which hurt revenue generation. If this exists, these related metrics should be monitored simultaneously.

@@ -1,0 +1,273 @@
+---
+title: "Airbnb Data Science Inference Data Challenge"
+output:
+  html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE)
+```
+
+```{r load-data}
+library(data.table)
+library(ggplot2)
+library(MASS)
+
+folder <- './'
+assignmentDT <- data.table::fread(file.path(folder, 'assignments__288_29.csv'))
+contactDT <- data.table::fread(file.path(folder, 'contacts__285_29.csv'))
+```
+
+## Data Sanity Check
+```{r sanity-check}
+# Convert variable data types
+contactDT[, `:=`(ts_interaction_first = as.POSIXct(ts_interaction_first, format='%Y-%m-%d %H:%M:%S.0', tz='UTC')
+                 , ts_reply_at_first = as.POSIXct(ts_reply_at_first, format='%Y-%m-%d %H:%M:%S.0', tz='UTC')
+                 , ts_accepted_at_first = as.POSIXct(ts_accepted_at_first, format='%Y-%m-%d %H:%M:%S.0', tz='UTC')
+                 , ts_booking_at = as.POSIXct(ts_booking_at, format='%Y-%m-%d %H:%M:%S.0', tz='UTC')
+                 , ds_checkin_first = as.Date(ds_checkin_first)
+                 , ds_checkout_first = as.Date(ds_checkout_first)
+                 , dim_contact_channel_first = as.factor(dim_contact_channel_first)
+                 , dim_room_type = as.factor(dim_room_type)
+                 , dim_guest_language = NULL
+                 , dim_host_language = as.factor(dim_host_language))]
+
+# summary(contactDT)
+
+# Remove duplicated assignments
+assignmentDT[, .(uniq_cnt = length(unique(id_user_anon))), by = ab]
+assignmentDT <- unique(assignmentDT) # 19069
+
+# Any users assigned to both groups?
+assignmentDT[,  .N, by = id_user_anon][N==2, .N]
+
+# Are all the users for testing in the contact data?
+all(assignmentDT$id_user_anon %in% unique(contactDT$id_guest_anon))
+
+# number of unique guests and hosts in contact data
+contactDT[, lapply(.SD, function(x) length(unique(x))), .SDcols = c("id_guest_anon", "id_host_anon")]
+
+# Any IDs are both guests and hosts?
+length(intersect(unique(contactDT$id_guest_anon), unique(contactDT$id_host_anon))) 
+
+# date ranges
+contactDT[, lapply(.SD, range, na.rm=TRUE), .SDcols = c("ts_interaction_first"
+                                                        , "ts_reply_at_first"
+                                                        , "ts_accepted_at_first"
+                                                        , "ts_booking_at"
+                                                        , "ds_checkin_first"
+                                                        , "ds_checkout_first")]
+
+# Any records with checkin date < interaction_first date | booking_at date?
+contactDT[ds_checkin_first < as.Date(ts_interaction_first) | ds_checkin_first < as.Date(ts_booking_at), .N]
+
+# Any accepted-booking mismatch?
+contactDT[!is.na(ts_accepted_at_first) & is.na(ts_booking_at) | is.na(ts_accepted_at_first) & !is.na(ts_booking_at), .N]
+contactDT[!is.na(ts_accepted_at_first) & !is.na(ts_booking_at) & ts_accepted_at_first != ts_booking_at, .N] 
+
+# Any instant_booked records not having a booking timestamp?
+contactDT[dim_contact_channel_first=='instant_booked', sum(is.na(ts_booking_at))]
+
+# Any the book_it records without an inquiry?
+contactDT[dim_contact_channel_first=='book_it', sum(is.na(ts_interaction_first))]
+
+# Any listings having one-to-many mapping to room types?
+contactDT[, .(num_room_types = length(unique(dim_room_type))), by = id_listing_anon][num_room_types > 1, .N]
+
+# distribution of number of records made by the same guests
+contactDT[,  .(guest_record_cnt = .N), by = id_guest_anon][, .N,  by = guest_record_cnt][order(-N)]
+
+# How many book_it records not having an acceptance timestamp?
+contactDT[dim_contact_channel_first=='book_it', sum(is.na(ts_accepted_at_first))]
+
+# How many book_it records not recieving a reply?
+contactDT[dim_contact_channel_first=='book_it', sum(is.na(ts_reply_at_first))]
+```
+
+## Q1: Identifying factors that affect booking rate
+
+### Initial Model
+```{r logit-model1}
+# Add derived input variables: m_stay_days, m_interation_to_checkin_days, m_interaction_to_reply_hours
+# and target binary variable: booking
+contactDT[, `:=`(m_stay_days = as.integer(ds_checkout_first - ds_checkin_first)
+                 , m_interaction_to_checkin_days = as.integer(ds_checkout_first - as.Date(ts_interaction_first))
+                 , m_interaction_to_reply_hours = as.numeric(difftime(ts_reply_at_first, ts_interaction_first, units = "hours"))
+                 , booking = ifelse(is.na(ts_booking_at), FALSE, TRUE))]
+
+# logistic regression model 1
+bookingProbModel1 <- glm(booking ~ m_guests_first + 
+                          m_interactions + 
+                          m_first_message_length_in_characters + 
+                          dim_room_type +
+                          dim_total_reviews +
+                          dim_person_capacity +
+                          dim_host_language +
+                          m_stay_days +
+                          m_interaction_to_checkin_days +
+                          m_interaction_to_reply_hours
+                         , data = contactDT[dim_contact_channel_first=='book_it'], family = binomial(link=logit))
+
+summary(bookingProbModel1)
+```
+
+### Model Selection
+```{r model-selection}
+# model selection using stepwise AIC
+MASS::stepAIC(bookingProbModel1)
+```
+
+### Updated Model
+```{r logit-model2}
+# logistic regression model 2
+# remove host_language
+bookingProbModel2 <- glm(booking ~ m_guests_first + 
+                          m_interactions + 
+                          m_first_message_length_in_characters + 
+                          dim_room_type +
+                          dim_total_reviews +
+                          dim_person_capacity +
+                          m_stay_days +
+                          m_interaction_to_checkin_days + 
+                          m_interaction_to_reply_hours
+                         , data = contactDT[dim_contact_channel_first=='book_it'], family = binomial(link=logit))
+
+summary(bookingProbModel2)
+```
+
+### Model Diagnostic
+```{r model-diagnostic, fig.width=8, fig.height=6}
+plot(fitted(bookingProbModel2), residuals(bookingProbModel2), xlab = 'Fitted', ylab = 'Residuals')
+plot(residuals(bookingProbModel2, type="deviance"), xlab = "Case Number Index", ylab = 'Deviance Residuals')
+plot(hatvalues(bookingProbModel2), ylab="Hat value", xlab="Case Number Index")
+```
+
+### Model Interpretation
+```{r model-coefficients, fig.width=12, fig.height=8}
+# Exponentiate estimated coefficients in order to get odds-ratio interpretations
+expCoefs <- exp(coefficients(bookingProbModel2))
+# Exponentiate Wald confidence intervals to get on the odds-scale
+expCoefCIs <- exp(confint.default(bookingProbModel2, level=0.95))
+expCoefsDT <- data.table(data.frame(cbind(expCoefs,expCoefCIs)), keep.rownames=TRUE)
+colnames(expCoefsDT) <- c("variable", "point_est", "CI_lower", "CI_upper")
+expCoefsDT <- expCoefsDT[variable!='(Intercept)'][order(-point_est)]
+
+# plot ranked (exponentiated) coefficent estimates and CIs
+MakeConfIntPlot <- function(DT, xPt, xLower, xUpper, yVar, groupVar=NULL, xLab='', title='', ...){
+  p <- ggplot2::ggplot(data = DT, aes_string(x=xPt, y=yVar, color=groupVar)) +
+    ggplot2::geom_point() +
+    ggplot2::geom_errorbarh(aes_string(xmax = xUpper, xmin = xLower, height = .1)) +
+    ggplot2::theme_bw() +
+    ggplot2::labs(x = xLab, y = NULL) +
+    ggplot2::ggtitle(title) +
+    ggplot2::theme(axis.text=element_text(size=12, face="bold"),
+                   axis.title=element_text(size=14, face="bold"),
+                   legend.text=element_text(size=12),
+                   legend.title=element_text(size=12),
+                   title=element_text(size=16, face="bold"))
+  return(p)
+}
+
+expCoefsDT[, variable := factor(variable, levels=expCoefsDT[order(point_est),variable])]
+p <- MakeConfIntPlot(expCoefsDT, xPt = 'point_est', xLower = 'CI_lower', xUpper = 'CI_upper', yVar = 'variable', xLab='Coefficient Estimate')
+print(p)
+```
+
+## Q2: A/B testing on effects of minimum word count requirement
+
+```{r join-assignment-and-contact}
+# Remove bias introduced by including missing value cases only in control group
+contactDT[, sum(is.na(m_first_message_length_in_characters)), by=dim_contact_channel_first]
+contactDT.ab <- contactDT[!is.na(m_first_message_length_in_characters),] 
+
+ids_a <- assignmentDT[ab=='treatment', id_user_anon]
+ids_b <- assignmentDT[ab=='control', id_user_anon]
+
+# Some subjects in treatment group are not associated with messages having > 140 words
+all(ids_a %in% contactDT.ab[m_first_message_length_in_characters >= 140, unique(id_guest_anon)])
+
+contactDT.ab[, group := rep('', .N)]
+contactDT.ab[id_guest_anon %in% ids_a & m_first_message_length_in_characters >= 140, group := 'treatment']
+contactDT.ab[id_guest_anon %in% ids_b & group == '', group := 'control']
+contactDT.ab <- contactDT.ab[group!='',][, group := as.factor(group)]
+```
+
+### Check invariant metrics over different groups
+```{r check-numerical-variable-distributions, fig.width=8, fig.height=6}
+# numerical variables
+MakeMetricBoxplot <- function(DT, xVar, yVar, groupVar=NULL, xLab='', yLab='', title='', ...){
+  p <- ggplot2::ggplot(DT, aes_string(x = xVar, y = yVar, fill = groupVar)) +
+    ggplot2::geom_boxplot(...) +
+    ggplot2::theme_bw()+ 
+    ggplot2::xlab(xLab) +
+    ggplot2::ylab(yLab) +
+    ggplot2::ggtitle(title) +
+    ggplot2::theme(axis.text=element_text(size=14, face="bold"),
+                   axis.title=element_text(size=16, face="bold"),
+                   legend.text=element_text(size=14),
+                   legend.title=element_text(size=14),
+                   title=element_text(size=18, face="bold"))
+  return(p)
+}
+
+numericVars <- c("m_guests_first", "m_interactions", "m_stay_days", "m_interaction_to_checkin_days", "dim_total_reviews", "dim_person_capacity")
+for(numVar in numericVars){
+  p <- MakeMetricBoxplot(contactDT.ab, xVar = 'group', yVar = numVar, groupVar = 'group', yLab = numVar)
+  print(p)
+}
+```
+
+```{r check-categorical-variable-frequencies}
+# categorical variables
+catVars <- c("dim_contact_channel_first", "dim_room_type", "dim_host_language")
+for(catVar in catVars){
+  print(contactDT.ab[, .N, by=c(catVar, "group")])
+}
+```
+
+```{r two-props-test}
+# booking rate two proportion z-test
+contactDT.ab[, .(booking_rate = sum(booking)/.N), by=group]
+prop.test(table(contactDT.ab$group, !contactDT.ab$booking), alternative='two.sided', correct=FALSE)
+```
+
+## Q3: Test for change of response time limit 
+
+```{r resp-time-distributions, fig.width=12, fig.height=8}
+# response time quantiles
+summary(contactDT$m_interaction_to_reply_hours)
+
+# Consider cases with first replies received within 3 days
+contactDT.timeTest <- contactDT[m_interaction_to_reply_hours < 3*24]
+
+MakeHistDenPlot <- function(DT, xVar, groupVar=NULL, bins=30, position="identity",  xLab='', title='', ...){
+  p <- ggplot2::ggplot(DT, mapping = aes_string(x=xVar, fill=groupVar, color=groupVar), ...) + 
+    ggplot2::geom_histogram(mapping = aes(y=..density..),    
+                            bins=bins, position=position, alpha=.3) +
+    ggplot2::geom_density(mapping = aes_string(color=groupVar), alpha=0, size=1.5) +
+    ggplot2::theme_bw() +
+    ggplot2::xlab(xLab) +
+    ggplot2::ggtitle(title) +
+    ggplot2::theme(axis.text=element_text(size=14, face="bold"),
+                   axis.title=element_text(size=16, face="bold"),
+                   legend.text=element_text(size=14),
+                   legend.title=element_text(size=14),
+                   title=element_text(size=18, face="bold"))
+  return(p)
+}
+p <- MakeHistDenPlot(contactDT.timeTest, xVar = 'm_interaction_to_reply_hours', groupVar = 'booking', xLab='interaction_to_reply_hours (< 72 hrs)')
+print(p)
+```
+
+```{r breakdown, fig.width=12, fig.height=8}
+contactDT.timeTest[, `:=`(dow = ordered(weekdays(ts_interaction_first, abbreviate=TRUE), levels = c("Mon","Tue","Wed","Thu","Fri","Sat","Sun"))
+                     , month = ordered(months(ts_interaction_first, abbreviate=TRUE), levels = c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")))]
+
+groupVars <- c("dim_host_language", "dow", "month")
+for(grpVar in groupVars){
+  p <- MakeMetricBoxplot(contactDT.timeTest, xVar = grpVar, yVar = 'm_interaction_to_reply_hours'
+                         , groupVar = NULL, yLab = 'interaction_to_reply_hours')
+  p <- p + stat_summary(fun.data = function(x){c(y = mean(x), label = length(x))}, geom = "text")
+  print(p)
+}
+```
